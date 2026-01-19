@@ -132,7 +132,7 @@ Memory-bounded streaming processor. Handles files larger than GPU memory.
 - `cuda_replace.cu` - CUDA kernel implementation
 - `cuda_replace_wrapper.py` - Python ctypes interface
 - `bin/` - Pre-compiled libraries
-- `examples/` - Usage examples
+- `test/` - Usage examples
 
 ## Example: Tokenizer Preprocessing
 
