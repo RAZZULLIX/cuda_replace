@@ -151,12 +151,35 @@ The floor for *returning* a fresh `bytes` of size `N` is the host memory
 allocation (page faults), which `bytes.replace` pays once too. That's why the
 single-shot case isn't "way faster", but batching is.
 
-Numbers measured on an RTX 3090, enwik8 (100 MB), 100 two-byte patterns:
+## Benchmarks
 
-```
-CPU  bytes.replace chain   : ~15.3 s
-GPU  Session.apply_batch   : ~1.1 s   (13.4×)
-```
+Measured on an RTX 3090, enwik8 (100 MB). "apply" times are warm-session
+(no transfer) — raw GPU compute. "batch" and "one-shot" include the
+host⇄device transfer.
+
+### Raw compute — `Session.apply()` (one pattern, one pass over 100 MB)
+
+| Pattern → Replacement | Pattern len | Time |
+|---|---|---|
+| `b"e"` → `b"E"` | 1 (single-byte fast path) | 4.5 ms |
+| `b"a"` → `b"THE"` | 1 (expansion) | 4.6 ms |
+| `b"th"` → `b"TH"` | 2 | 6.0 ms |
+| `b" the "` → `b" THE "` | 5 | 8.1 ms |
+
+### Batch — 100 two-byte patterns, `Session.apply_batch()` (one transfer)
+
+| | Time |
+|---|---|
+| CPU `bytes.replace` chain | ~15.3 s |
+| GPU `apply_batch` | ~1.14 s |
+| **Speedup** | **13.4×** |
+
+### One-shot — `unified()` (open → apply → result → close, cold)
+
+| | Time |
+|---|---|
+| CPU `bytes.replace` | 80–240 ms (pattern-dependent) |
+| GPU `unified` | ~280–335 ms |
 
 ---
 
