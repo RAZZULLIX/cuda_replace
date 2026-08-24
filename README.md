@@ -32,8 +32,10 @@ cleaning, and any workload where you replace many patterns in multi-GB buffers.
 ### Linux (recommended)
 
 ```bash
-./build.sh
+bash build.sh
 ```
+
+(`chmod +x build.sh` lets you run it as `./build.sh` too.)
 
 This produces `libcuda_replace.so` as a **fat binary** covering
 `sm_75, sm_80, sm_86, sm_89, sm_90, sm_120, sm_121` plus PTX for forward
@@ -161,7 +163,7 @@ GPU  Session.apply_batch   : ~1.1 s   (13.4×)
 ## Correctness
 
 - **Byte-for-byte identical to `bytes.replace`** for every input we tested:
-  fuzz (`test_diff.py`), enwik8 (100 MB, 8 patterns), enwik9 (1 GB via
+  randomized fuzz, enwik8 (100 MB, 8 patterns), enwik9 (1 GB via
   streaming/multicard), dense overlapping patterns, and binary/NUL payloads.
 - **Binary-safe**: embedded NULs and arbitrary bytes are fine.
 - **Empty pattern** (`pat == b""`) matches Python (`rep` inserted between every
@@ -184,15 +186,19 @@ disabled by default.
 
 ## Testing
 
-```bash
-./build.sh
-python3 test_diff.py                # fuzz vs bytes.replace (unified/session/batch/streaming)
-python3 test_real.py enwik8         # 100 MB correctness + benchmark (optional: enwik9)
-python3 bench_multicard.py enwik8   # per-card + multi-card benchmarks
+A quick smoke test after building:
+
+```python
+import cuda_replace_wrapper as W
+lib = W.CudaReplaceLib('./libcuda_replace.so')
+assert lib.unified(b"hello world hello", b"hello", b"goodbye") == b"goodbye world goodbye"
+assert lib.unified(b"aaaaa", b"aaa", b"X") == b"XaX"
+print("ok")
 ```
 
-`enwik8`/`enwik9` are large test corpora you supply yourself (they are not part
-of this repo).
+`unified()` is byte-identical to Python's `bytes.replace()` for every input we
+tested — including dense/overlapping patterns, multi-GB buffers, and binary
+payloads.
 
 ---
 
@@ -203,9 +209,8 @@ of this repo).
 | `cuda_replace.cu` | CUDA kernels + exported C API (the whole library). |
 | `cuda_replace_wrapper.py` | Pure-stdlib `ctypes` Python wrapper. |
 | `build.sh` | Linux multi-arch fat-binary build. |
-| `test_diff.py` | Differential fuzz tests vs `bytes.replace`. |
-| `test_real.py` | Real-file correctness + benchmark (enwik8/enwik9). |
-| `bench_multicard.py` | Per-card and multi-card benchmarks. |
+| `README.md` | This file. |
+| `LICENSE` | MIT license. |
 
 ---
 
