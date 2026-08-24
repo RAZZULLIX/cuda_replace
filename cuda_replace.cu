@@ -147,6 +147,10 @@ struct CRContext
     uint8_t *d_tmp = nullptr;
     size_t len = 0;
 
+    // Persistent pinned host staging for cuda_replace_result (reused across calls).
+    uint8_t *h_out = nullptr;
+    size_t h_out_cap = 0;
+
     // **Split capacities**
     size_t cap = 0;     // capacity of d_buf / d_tmp
     size_t aux_cap = 0; // capacity for aux arrays below
@@ -197,10 +201,10 @@ struct CRContext
     int *d_fused_last = nullptr; // [fused_num_tiles]
     int *d_fused_prev = nullptr; // [fused_num_tiles]
 
-    // device staging for batch (single-buffer, sync H2D)
-    uint8_t *d_pat_buf[1] = {nullptr};
+    // device staging for pattern/replacement (reused across apply calls)
+    uint8_t *d_pat_stage = nullptr;
     size_t d_pat_cap = 0;
-    uint8_t *d_rep_buf[1] = {nullptr};
+    uint8_t *d_rep_stage = nullptr;
     size_t d_rep_cap = 0;
 
     // streams
@@ -333,24 +337,6 @@ __global__ void scan_counts_stage3_add_kernel(
         out_excl[base + t] += add;
 }
 
-__global__ void scan_counts_stage3_add_kernel(
-    int *__restrict__ out_excl, int n,
-    const int *__restrict__ tile_prefix)
-{
-    const int tile = blockIdx.x;
-    const int base = tile * SCAN_TILE;
-    int limit = n - base;
-    if (limit <= 0)
-        return;
-    if (limit > SCAN_TILE)
-        limit = SCAN_TILE;
-
-    int add = tile_prefix[tile];
-    int t = threadIdx.x;
-    if (t < limit)
-        out_excl[base + t] += add;
-}
-
 static cudaError_t ensure_tiles(CRContext *c, int n_elems)
 {
     cudaError_t err = cudaSuccess;
@@ -361,15 +347,14 @@ static cudaError_t ensure_tiles(CRContext *c, int n_elems)
         return cudaSuccess;
 
     int *ts = nullptr;
-    // --- FIX START ---
-    // Match the type of tp and old_tp to the 64-bit d_tile_prefix in CRContext.
     size_t *tp = nullptr;
+    int *old_ts = nullptr;
+    size_t *old_tp = nullptr;
     CUDA_OK(cudaMalloc(&ts, (size_t)num_tiles * sizeof(int)));
     CUDA_OK(cudaMalloc(&tp, (size_t)num_tiles * sizeof(size_t)));
 
-    int *old_ts = c->d_tile_sums;
-    size_t *old_tp = c->d_tile_prefix;
-    // --- FIX END ---
+    old_ts = c->d_tile_sums;
+    old_tp = c->d_tile_prefix;
 
     c->d_tile_sums = ts;
     c->d_tile_prefix = tp;
@@ -474,6 +459,17 @@ __global__ void mark_match_positions_kernel_gmem(
                  simple_pattern_match(data, pos, data_len, pattern, pattern_len);
         match_positions[pos] = m;
     }
+}
+
+// Single-byte fast path: with L==1 every match is kept (non-overlapping is
+// trivially satisfied), so no greedy suppression is needed at all.
+__global__ void mark_single_byte_kernel(
+    const uint8_t *__restrict__ data, size_t n,
+    const uint8_t *__restrict__ pat, bool *__restrict__ kept)
+{
+    const uint8_t b = pat[0];
+    for (size_t pos = grid_stride_start(); pos < n; pos += grid_stride_step())
+        kept[pos] = (data[pos] == b);
 }
 
 // pass1: local greedy (inside each block's byte-range), store last kept per block
@@ -994,6 +990,58 @@ __global__ void last_true_before_limit_kernel(
     }
 }
 
+// forward declaration (defined later in this file)
+static cudaError_t ensure_blocks(CRContext *c, size_t for_len);
+
+// ===== NEW: stats over a kept-starts bitmap (count, first, last) =====
+// first must be initialized to INT_MAX, last to -1, count to 0 (by caller).
+__global__ void bitmap_stats_kernel(
+    const bool *__restrict__ bm, size_t n,
+    int *__restrict__ count, int *__restrict__ first, int *__restrict__ last)
+{
+    for (size_t pos = grid_stride_start(); pos < n; pos += grid_stride_step())
+    {
+        if (bm[pos])
+        {
+            atomicAdd(count, 1);
+            atomicMin(first, (int)pos);
+            atomicMax(last, (int)pos);
+        }
+    }
+}
+
+// Compute kept count/first/last from the current kept-starts bitmap (c->d_match).
+// Used by the fused mark+suppress path, which produces the final bitmap directly
+// without the index-based greedy that would otherwise populate these scalars.
+static int compute_kept_stats_from_bitmap(CRContext *c)
+{
+    cudaError_t err = cudaSuccess;
+    int hint_max = INT_MAX;
+    int hint_minus = -1;
+
+    if (c->len == 0)
+    {
+        CUDA_OK(cudaMemcpyAsync(c->d_kept_count, &hint_minus, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+        CUDA_OK(cudaMemcpyAsync(c->d_first_kept, &hint_minus, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+        CUDA_OK(cudaMemcpyAsync(c->d_last_kept, &hint_minus, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+        CUDA_OK(cudaStreamSynchronize(c->stream));
+        return 0;
+    }
+
+    compute_launch(c);
+    CUDA_OK(ensure_blocks(c, c->len));
+    CUDA_OK(cudaMemcpyAsync(c->d_kept_count, &hint_minus, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+    CUDA_OK(cudaMemcpyAsync(c->d_first_kept, &hint_max, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+    CUDA_OK(cudaMemcpyAsync(c->d_last_kept, &hint_minus, sizeof(int), cudaMemcpyHostToDevice, c->stream));
+    bitmap_stats_kernel<<<c->grid, c->block, 0, c->stream>>>(
+        c->d_match, c->len, c->d_kept_count, c->d_first_kept, c->d_last_kept);
+    KERNEL_OK();
+    CUDA_OK(cudaStreamSynchronize(c->stream));
+    return 0;
+cuda_fail:
+    return (int)err;
+}
+
 // ===========================
 // Atomic allocation helpers
 // ===========================
@@ -1007,10 +1055,12 @@ static cudaError_t ensure_blocks(CRContext *c, size_t for_len)
         return cudaSuccess;
 
     int *nbc = nullptr, *nbp = nullptr;
+    int *old_bc = nullptr, *old_bp = nullptr;
     CUDA_OK(cudaMalloc(&nbc, (size_t)blocks * sizeof(int)));
     CUDA_OK(cudaMalloc(&nbp, (size_t)blocks * sizeof(int)));
 
-    int *old_bc = c->d_bcounts, *old_bp = c->d_bprefix;
+    old_bc = c->d_bcounts;
+    old_bp = c->d_bprefix;
     c->d_bcounts = nbc;
     c->d_bprefix = nbp;
     c->blocks_cap = blocks;
@@ -1039,6 +1089,7 @@ static cudaError_t ensure_main_capacity(CRContext *c, size_t need)
         new_cap <<= 1;
 
     uint8_t *nd = nullptr, *nt = nullptr;
+    uint8_t *old_buf = nullptr, *old_tmp = nullptr;
     CUDA_OK(cudaMalloc(&nd, new_cap));
     CUDA_OK(cudaMalloc(&nt, new_cap));
 
@@ -1048,7 +1099,8 @@ static cudaError_t ensure_main_capacity(CRContext *c, size_t need)
         CUDA_OK(cudaStreamSynchronize(c->stream));
     }
 
-    uint8_t *old_buf = c->d_buf, *old_tmp = c->d_tmp;
+    old_buf = c->d_buf;
+    old_tmp = c->d_tmp;
     c->d_buf = nd;
     c->d_tmp = nt;
     c->cap = new_cap;
@@ -1082,6 +1134,10 @@ static cudaError_t ensure_aux_for_len(CRContext *c, size_t need)
     uint16_t *np = nullptr;
     uint8_t *nf = nullptr;
     int *nl = nullptr;
+    bool *om = nullptr, *om2 = nullptr;
+    uint16_t *op = nullptr;
+    uint8_t *of = nullptr;
+    int *ol = nullptr;
 
     CUDA_OK(cudaMalloc(&nm, new_cap * sizeof(bool)));
     CUDA_OK(cudaMalloc(&nm2, new_cap * sizeof(bool)));
@@ -1089,10 +1145,11 @@ static cudaError_t ensure_aux_for_len(CRContext *c, size_t need)
     CUDA_OK(cudaMalloc(&nf, new_cap * sizeof(uint8_t)));
     CUDA_OK(cudaMalloc(&nl, new_cap * sizeof(int)));
 
-    bool *om = c->d_match, *om2 = c->d_match2;
-    uint16_t *op = c->d_padded;
-    uint8_t *of = c->d_flags;
-    int *ol = c->d_local;
+    om = c->d_match;
+    om2 = c->d_match2;
+    op = c->d_padded;
+    of = c->d_flags;
+    ol = c->d_local;
 
     c->d_match = nm;
     c->d_match2 = nm2;
@@ -1156,31 +1213,37 @@ static cudaError_t ensure_chunk_buffers(CRContext *c, int num_chunks)
     uint8_t *n_flags = nullptr;
     int *n_local = nullptr, *n_indices = nullptr;
     int *n_bcounts = nullptr, *n_bprefix = nullptr;
+    int chunk_blocks = (num_chunks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    size_t *o_addrs = nullptr;
+    uint64_t *o_masks = nullptr;
+    uint8_t *o_flags = nullptr;
+    int *o_local = nullptr;
+    int *o_bcounts = nullptr;
+    int *o_bprefix = nullptr;
+    int *o_indices = nullptr;
 
     CUDA_OK(cudaMalloc(&n_addrs, (size_t)num_chunks * sizeof(size_t)));
     CUDA_OK(cudaMalloc(&n_masks, (size_t)num_chunks * 4 * sizeof(uint64_t)));
     CUDA_OK(cudaMalloc(&n_flags, (size_t)num_chunks * sizeof(uint8_t)));
     CUDA_OK(cudaMalloc(&n_local, (size_t)num_chunks * sizeof(int)));
     CUDA_OK(cudaMalloc(&n_indices, (size_t)num_chunks * sizeof(int)));
-
-    int chunk_blocks = (num_chunks + BLOCK_SIZE - 1) / BLOCK_SIZE;
     CUDA_OK(cudaMalloc(&n_bcounts, (size_t)chunk_blocks * sizeof(int)));
     CUDA_OK(cudaMalloc(&n_bprefix, (size_t)chunk_blocks * sizeof(int)));
 
     // success → swap, then free old
-    size_t *o_addrs = c->d_chunk_addrs;
+    o_addrs = c->d_chunk_addrs;
     c->d_chunk_addrs = n_addrs;
-    uint64_t *o_masks = c->d_chunk_masks;
+    o_masks = c->d_chunk_masks;
     c->d_chunk_masks = n_masks;
-    uint8_t *o_flags = c->d_chunk_flags;
+    o_flags = c->d_chunk_flags;
     c->d_chunk_flags = n_flags;
-    int *o_local = c->d_chunk_local;
+    o_local = c->d_chunk_local;
     c->d_chunk_local = n_local;
-    int *o_bcounts = c->d_chunk_bcounts;
+    o_bcounts = c->d_chunk_bcounts;
     c->d_chunk_bcounts = n_bcounts;
-    int *o_bprefix = c->d_chunk_bprefix;
+    o_bprefix = c->d_chunk_bprefix;
     c->d_chunk_bprefix = n_bprefix;
-    int *o_indices = c->d_chunk_indices;
+    o_indices = c->d_chunk_indices;
     c->d_chunk_indices = n_indices;
 
     c->num_chunks = num_chunks;
@@ -1252,10 +1315,10 @@ static int mark_matches_dispatch(CRContext *c, const uint8_t *d_pat, int pat_len
     if (c->len == 0)
         return 0;
 
-    CUDA_OK(cudaMemsetAsync(c->d_match, 0, c->len * sizeof(bool), c->stream));
-
     const int max_smem = dev_max_smem();
     const bool use_smem = (pat_len > 0 && pat_len <= max_smem);
+
+    CUDA_OK(cudaMemsetAsync(c->d_match, 0, c->len * sizeof(bool), c->stream));
 
     if (c->grid.x == 0)
         return 0; // nothing to launch
@@ -1287,6 +1350,8 @@ static int fused_mark_suppress_bitmap(CRContext *c, const uint8_t *d_pat, int L)
     if (c->fused_tile_bytes <= 0)
         return -2;
 
+    int halo = (L > 0 ? L - 1 : 0);
+    size_t smem_need = (size_t)L + (size_t)c->fused_tile_bytes + (size_t)halo + (size_t)c->fused_tile_bytes;
     int num_tiles = (int)((c->len + (size_t)c->fused_tile_bytes - 1) / (size_t)c->fused_tile_bytes);
     if (num_tiles <= 0)
     {
@@ -1308,9 +1373,6 @@ static int fused_mark_suppress_bitmap(CRContext *c, const uint8_t *d_pat, int L)
         c->d_fused_prev = n_prev;
         c->fused_num_tiles = num_tiles;
     }
-
-    int halo = (L > 0 ? L - 1 : 0);
-    size_t smem_need = (size_t)L + (size_t)c->fused_tile_bytes + (size_t)halo + (size_t)c->fused_tile_bytes;
 
     if (smem_need > (size_t)dev_max_smem())
         return -2;
@@ -1340,6 +1402,8 @@ static int fused_mark_suppress_bitmap_seeded(CRContext *c, const uint8_t *d_pat,
     if (c->fused_tile_bytes <= 0)
         return -2;
 
+    int halo = (L > 0 ? L - 1 : 0);
+    size_t smem_need = (size_t)L + (size_t)c->fused_tile_bytes + (size_t)halo + (size_t)c->fused_tile_bytes;
     int num_tiles = (int)((c->len + (size_t)c->fused_tile_bytes - 1) / (size_t)c->fused_tile_bytes);
     if (num_tiles <= 0)
     {
@@ -1360,9 +1424,6 @@ static int fused_mark_suppress_bitmap_seeded(CRContext *c, const uint8_t *d_pat,
         c->d_fused_prev = n_prev;
         c->fused_num_tiles = num_tiles;
     }
-
-    int halo = (L > 0 ? L - 1 : 0);
-    size_t smem_need = (size_t)L + (size_t)c->fused_tile_bytes + (size_t)halo + (size_t)c->fused_tile_bytes;
 
     if (smem_need > (size_t)dev_max_smem())
         return -2;
@@ -1623,6 +1684,12 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
             *h_last_kept = -1;
         return 0;
     }
+    int rc = 0;
+    int h_matches = 0;
+    int *d_indices = nullptr;
+    uint8_t *d_keep_flags = nullptr;
+    int kept = 0, first_kept = -1, last_kept = -1;
+
     compute_launch(c);
     CUDA_OK(ensure_blocks(c, c->len));
     if (c->grid.x == 0)
@@ -1639,7 +1706,7 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
     build_match_flags_localpos_kernel<<<c->grid, c->block, 0, c->stream>>>(c->d_match, c->len, c->d_flags, c->d_local, c->d_bcounts);
     KERNEL_OK();
     // Scan block counts
-    int rc = device_scan_counts(c, c->grid.x, c->d_bcounts, c->d_bprefix);
+    rc = device_scan_counts(c, c->grid.x, c->d_bcounts, c->d_bprefix);
     if (rc != 0)
     {
         err = cudaErrorUnknown;
@@ -1648,7 +1715,6 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
     // Compute total matches
     compute_total_matches_kernel<<<1, 1, 0, c->stream>>>(c->d_bprefix, c->d_bcounts, c->grid.x, c->d_totmatch);
     KERNEL_OK();
-    int h_matches = 0;
     CUDA_OK(cudaMemcpyAsync(&h_matches, c->d_totmatch, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaStreamSynchronize(c->stream));
     if (h_matches == 0)
@@ -1668,8 +1734,6 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
         return 0;
     }
     // Allocate and compute kept indices
-    int *d_indices = nullptr;
-    uint8_t *d_keep_flags = nullptr;
     CUDA_OK(cudaMalloc(&d_indices, (size_t)h_matches * sizeof(int)));
     CUDA_OK(cudaMalloc(&d_keep_flags, (size_t)h_matches * sizeof(uint8_t)));
     CUDA_OK(cudaMemsetAsync(d_keep_flags, 0, (size_t)h_matches * sizeof(uint8_t), c->stream));
@@ -1679,7 +1743,6 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
     greedy_keep_on_indices_kernel<<<1, 1, 0, c->stream>>>(d_indices, h_matches, pat_len, d_keep_flags, c->d_kept_count, c->d_first_kept, c->d_last_kept);
     KERNEL_OK();
     // Copy results back
-    int kept = 0, first_kept = -1, last_kept = -1;
     CUDA_OK(cudaMemcpyAsync(&kept, c->d_kept_count, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaMemcpyAsync(&first_kept, c->d_first_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaMemcpyAsync(&last_kept, c->d_last_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
@@ -1704,6 +1767,10 @@ static int suppress_global_leftmost(CRContext *c, int pat_len, int *h_kept_count
     cudaFree(d_keep_flags);
     return 0;
 cuda_fail:
+    if (d_indices)
+        cudaFree(d_indices);
+    if (d_keep_flags)
+        cudaFree(d_keep_flags);
     if (h_kept_count)
         *h_kept_count = 0;
     if (h_first_kept)
@@ -1729,6 +1796,12 @@ static int suppress_global_leftmost_seeded(
             *h_last_kept = -1;
         return 0;
     }
+    int rc = 0;
+    int m = 0;
+    int *d_indices = nullptr;
+    uint8_t *d_keep_flags = nullptr;
+    int kept = 0, first_kept = -1, last_kept = -1;
+
     compute_launch(c);
     CUDA_OK(ensure_blocks(c, c->len));
 
@@ -1736,19 +1809,16 @@ static int suppress_global_leftmost_seeded(
         c->d_match, c->len, c->d_flags, c->d_local, c->d_bcounts);
     KERNEL_OK();
 
+    rc = device_scan_counts(c, c->grid.x, c->d_bcounts, c->d_bprefix);
+    if (rc != 0)
     {
-        int rc = device_scan_counts(c, c->grid.x, c->d_bcounts, c->d_bprefix);
-        if (rc != 0)
-        {
-            err = cudaErrorUnknown;
-            goto cuda_fail;
-        }
+        err = cudaErrorUnknown;
+        goto cuda_fail;
     }
 
     compute_total_matches_kernel<<<1, 1, 0, c->stream>>>(c->d_bprefix, c->d_bcounts, c->grid.x, c->d_totmatch);
     KERNEL_OK();
 
-    int m = 0;
     CUDA_OK(cudaMemcpyAsync(&m, c->d_totmatch, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaStreamSynchronize(c->stream));
 
@@ -1769,8 +1839,6 @@ static int suppress_global_leftmost_seeded(
         return 0;
     }
 
-    int *d_indices = nullptr;
-    uint8_t *d_keep_flags = nullptr;
     CUDA_OK(cudaMalloc(&d_indices, (size_t)m * sizeof(int)));
     CUDA_OK(cudaMalloc(&d_keep_flags, (size_t)m * sizeof(uint8_t)));
     CUDA_OK(cudaMemsetAsync(d_keep_flags, 0, (size_t)m * sizeof(uint8_t), c->stream));
@@ -1784,7 +1852,6 @@ static int suppress_global_leftmost_seeded(
         d_keep_flags, c->d_kept_count, c->d_first_kept, c->d_last_kept);
     KERNEL_OK();
 
-    int kept = 0, first_kept = -1, last_kept = -1;
     CUDA_OK(cudaMemcpyAsync(&kept, c->d_kept_count, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaMemcpyAsync(&first_kept, c->d_first_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaMemcpyAsync(&last_kept, c->d_last_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
@@ -1810,6 +1877,10 @@ static int suppress_global_leftmost_seeded(
     return 0;
 
 cuda_fail:
+    if (d_indices)
+        cudaFree(d_indices);
+    if (d_keep_flags)
+        cudaFree(d_keep_flags);
     return (int)err;
 }
 
@@ -1839,16 +1910,19 @@ static int query_kept_prefix(CRContext *c, size_t limit, int *h_count, int *h_la
     // IMPORTANT: operate on the bitmap range [0, limit), NOT on c->len (which may be post-scatter).
     const size_t n = limit;
 
+    // Local launch config for n bytes (do NOT use c->grid, which was computed for c->len)
+    const int blocks = (int)((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const dim3 grid_n((unsigned)blocks, 1, 1);
+    const dim3 block_n(BLOCK_SIZE, 1, 1);
+    int cnt = 0;
+    int *d_out = nullptr;
+
     // Ensure capacity for exactly 'n' bytes of bitmap work
     CUDA_OK(ensure_aux_for_len(c, n));
     CUDA_OK(ensure_blocks(c, n));
 
-    // Local launch config for n bytes (do NOT use c->grid, which was computed for c->len)
-    const int blocks = (int)((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
     if (blocks <= 0)
         return 0;
-    const dim3 grid_n((unsigned)blocks, 1, 1);
-    const dim3 block_n(BLOCK_SIZE, 1, 1);
 
     // Build flags/local positions for KEPT bitmap over [0, n)
     build_match_flags_localpos_kernel<<<grid_n, block_n, 0, c->stream>>>(
@@ -1871,7 +1945,6 @@ static int query_kept_prefix(CRContext *c, size_t limit, int *h_count, int *h_la
         compute_total_matches_kernel<<<1, 1, 0, c->stream>>>(c->d_bprefix, c->d_bcounts, blocks, c->d_totmatch);
         KERNEL_OK();
 
-        int cnt = 0;
         CUDA_OK(cudaMemcpyAsync(&cnt, c->d_totmatch, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
         CUDA_OK(cudaStreamSynchronize(c->stream));
         *h_count = cnt;
@@ -1880,7 +1953,6 @@ static int query_kept_prefix(CRContext *c, size_t limit, int *h_count, int *h_la
     // Last kept-start index (< limit). Evaluate only within [0, n).
     if (h_last_lt)
     {
-        int *d_out = nullptr;
         CUDA_OK(cudaMalloc(&d_out, sizeof(int)));
         CUDA_OK(cudaMemsetAsync(d_out, 0xFF, sizeof(int), c->stream)); // -1
         last_true_before_limit_kernel<<<grid_n, block_n, 0, c->stream>>>(c->d_match, n, n, d_out);
@@ -1888,11 +1960,14 @@ static int query_kept_prefix(CRContext *c, size_t limit, int *h_count, int *h_la
         CUDA_OK(cudaMemcpyAsync(h_last_lt, d_out, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
         CUDA_OK(cudaStreamSynchronize(c->stream));
         cudaFree(d_out);
+        d_out = nullptr;
     }
 
     return 0;
 
 cuda_fail:
+    if (d_out)
+        cudaFree(d_out);
     return (int)err;
 }
 
@@ -1913,6 +1988,12 @@ static int apply_shrink(CRContext *c, const uint8_t *d_pat, int pat_len,
         return 0;
     }
 
+    size_t new_len = 0;
+    int kept = 0, first = -1, last = -1;
+    const int max_smem = dev_max_smem();
+    const bool use_smem = (pat_len + rep_len) <= max_smem && pat_len > 0 && rep_len >= 0;
+    const size_t smem = (size_t)pat_len + (size_t)rep_len;
+
     compute_launch(c);
     CUDA_OK(ensure_blocks(c, c->len));
     CUDA_OK(ensure_aux_for_len(c, c->len));
@@ -1924,21 +2005,15 @@ static int apply_shrink(CRContext *c, const uint8_t *d_pat, int pat_len,
         shrink_pad_kernel_fused<<<c->grid, c->block, 0, c->stream>>>(
             c->d_buf, c->len, c->d_match, d_pat, pat_len, d_rep, rep_len, c->d_padded);
     }
+    else if (use_smem)
+    {
+        shrink_pad_kernel_smem<<<c->grid, c->block, smem, c->stream>>>(
+            c->d_buf, c->len, c->d_match, d_pat, pat_len, d_rep, rep_len, c->d_padded);
+    }
     else
     {
-        const int max_smem = dev_max_smem();
-        bool use_smem = (pat_len + rep_len) <= max_smem && pat_len > 0 && rep_len >= 0;
-        if (use_smem)
-        {
-            size_t smem = (size_t)pat_len + (size_t)rep_len;
-            shrink_pad_kernel_smem<<<c->grid, c->block, smem, c->stream>>>(
-                c->d_buf, c->len, c->d_match, d_pat, pat_len, d_rep, rep_len, c->d_padded);
-        }
-        else
-        {
-            shrink_pad_kernel_gmem<<<c->grid, c->block, 0, c->stream>>>(
-                c->d_buf, c->len, c->d_match, d_pat, pat_len, d_rep, rep_len, c->d_padded);
-        }
+        shrink_pad_kernel_gmem<<<c->grid, c->block, 0, c->stream>>>(
+            c->d_buf, c->len, c->d_match, d_pat, pat_len, d_rep, rep_len, c->d_padded);
     }
     KERNEL_OK();
 
@@ -1959,7 +2034,6 @@ static int apply_shrink(CRContext *c, const uint8_t *d_pat, int pat_len,
     compute_total_len_kernel<<<1, 1, 0, c->stream>>>(c->d_bprefix, c->d_bcounts, c->grid.x, c->d_outlen);
     KERNEL_OK();
 
-    size_t new_len = 0;
     CUDA_OK(cudaMemcpyAsync(&new_len, c->d_outlen, sizeof(size_t), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaStreamSynchronize(c->stream));
 
@@ -1982,7 +2056,6 @@ static int apply_shrink(CRContext *c, const uint8_t *d_pat, int pat_len,
     // report kept info if requested
     if (o_kept || o_first_kept || o_last_kept)
     {
-        int kept = 0, first = -1, last = -1;
         CUDA_OK(cudaMemcpyAsync(&kept, c->d_kept_count, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
         CUDA_OK(cudaMemcpyAsync(&first, c->d_first_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
         CUDA_OK(cudaMemcpyAsync(&last, c->d_last_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
@@ -2014,6 +2087,11 @@ static int apply_expand(CRContext *c, const uint8_t *d_pat, int pat_len,
         return 0;
     }
 
+    int kept = 0, first_kept = -1, last_kept = -1;
+    const int diff = rep_len - pat_len;
+    size_t new_len = 0;
+    const size_t RANGE = (size_t)64 * 1024 * 1024; // 64 MiB slices of source positions
+
     compute_launch(c);
     CUDA_OK(ensure_blocks(c, c->len));
     CUDA_OK(ensure_aux_for_len(c, c->len));
@@ -2037,20 +2115,16 @@ static int apply_expand(CRContext *c, const uint8_t *d_pat, int pat_len,
     compute_total_matches_kernel<<<1, 1, 0, c->stream>>>(c->d_bprefix, c->d_bcounts, c->grid.x, c->d_totmatch);
     KERNEL_OK();
 
-    int kept = 0, first_kept = -1, last_kept = -1;
     CUDA_OK(cudaMemcpyAsync(&kept, c->d_totmatch, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     // also fetch first/last if produced earlier
     CUDA_OK(cudaMemcpyAsync(&first_kept, c->d_first_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaMemcpyAsync(&last_kept, c->d_last_kept, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     CUDA_OK(cudaStreamSynchronize(c->stream));
 
-    const int diff = rep_len - pat_len;
-    size_t new_len = c->len + (size_t)kept * (size_t)diff;
+    new_len = c->len + (size_t)kept * (size_t)diff;
 
     CUDA_OK(ensure_main_capacity(c, new_len ? new_len : 1));
 
-    // Range-sliced expansion to avoid long-running kernels on huge inputs
-    const size_t RANGE = (size_t)64 * 1024 * 1024; // 64 MiB slices of source positions
     for (size_t s = 0; s < c->len; s += RANGE)
     {
         size_t e = (s + RANGE < c->len ? s + RANGE : c->len);
@@ -2108,19 +2182,46 @@ static int apply_once(CRContext *c, const uint8_t *d_pat, int pat_len,
         return 0;
     }
 
+    int used_fused = 0;
+
     compute_launch(c);
     CUDA_OK(ensure_blocks(c, c->len));
     CUDA_OK(ensure_aux_for_len(c, c->len));
 
     // mark & suppress
-    int used_fused = 0;
-    if (c->use_fused)
+    if (pat_len == 1 && c->len > 0)
+    {
+        // L==1: all matches are kept, so mark directly (fully parallel) and
+        // skip the fused/legacy suppression entirely.
+        mark_single_byte_kernel<<<c->grid, c->block, 0, c->stream>>>(c->d_buf, c->len, d_pat, c->d_match);
+        KERNEL_OK();
+        int rc = compute_kept_stats_from_bitmap(c);
+        if (rc != 0)
+        {
+            err = cudaErrorUnknown;
+            goto cuda_fail;
+        }
+        used_fused = 1; // reuse the (L==1-optimal) fused scatter path
+    }
+    else if (c->use_fused)
     {
         int rc = (initial_last <= INT_MIN / 8)
                      ? fused_mark_suppress_bitmap(c, d_pat, pat_len)
                      : fused_mark_suppress_bitmap_seeded(c, d_pat, pat_len, initial_last);
         if (rc == 0)
+        {
             used_fused = 1;
+            // The fused path writes the final kept-starts bitmap directly and
+            // skips the index-based greedy, so the kept/first/last scalars are
+            // never populated there. Compute them from the bitmap so apply_* and
+            // apply_seeded report correct values.
+            rc = compute_kept_stats_from_bitmap(c);
+            if (rc != 0)
+            {
+                err = cudaErrorUnknown;
+                goto cuda_fail;
+            }
+        }
         else if (rc != -2)
         {
             err = cudaErrorUnknown;
@@ -2158,6 +2259,59 @@ cuda_fail:
     return (int)err;
 }
 
+// Reusable device staging for the pattern/replacement bytes: grow once and
+// reuse across apply calls so we don't pay cudaMalloc/cudaFree per call.
+static cudaError_t stage_pattern_rep(CRContext *c,
+                                     const uint8_t *pat, int pat_len,
+                                     const uint8_t *rep, int rep_len,
+                                     uint8_t **d_pat, uint8_t **d_rep)
+{
+    cudaError_t err = cudaSuccess;
+    *d_pat = nullptr;
+    *d_rep = nullptr;
+
+    if (pat_len > 0)
+    {
+        if ((size_t)pat_len > c->d_pat_cap)
+        {
+            size_t ncap = c->d_pat_cap ? c->d_pat_cap : 64;
+            while (ncap < (size_t)pat_len)
+                ncap <<= 1;
+            uint8_t *np = nullptr;
+            CUDA_OK(cudaMalloc(&np, ncap));
+            if (c->d_pat_stage)
+                cudaFree(c->d_pat_stage);
+            c->d_pat_stage = np;
+            c->d_pat_cap = ncap;
+        }
+        CUDA_OK(cudaMemcpyAsync(c->d_pat_stage, pat, (size_t)pat_len, cudaMemcpyHostToDevice, c->stream));
+        *d_pat = c->d_pat_stage;
+    }
+
+    if (rep_len > 0)
+    {
+        if ((size_t)rep_len > c->d_rep_cap)
+        {
+            size_t ncap = c->d_rep_cap ? c->d_rep_cap : 64;
+            while (ncap < (size_t)rep_len)
+                ncap <<= 1;
+            uint8_t *nr = nullptr;
+            CUDA_OK(cudaMalloc(&nr, ncap));
+            if (c->d_rep_stage)
+                cudaFree(c->d_rep_stage);
+            c->d_rep_stage = nr;
+            c->d_rep_cap = ncap;
+        }
+        CUDA_OK(cudaMemcpyAsync(c->d_rep_stage, rep, (size_t)rep_len, cudaMemcpyHostToDevice, c->stream));
+        *d_rep = c->d_rep_stage;
+    }
+
+    CUDA_OK(cudaStreamSynchronize(c->stream));
+    return cudaSuccess;
+cuda_fail:
+    return err;
+}
+
 // ===========================
 // Exports — session & one-shot
 // ===========================
@@ -2179,6 +2333,16 @@ extern "C"
             cudaFree(c->d_buf);
         if (c->d_tmp)
             cudaFree(c->d_tmp);
+
+        // Pinned host staging buffer
+        if (c->h_out)
+            cudaFreeHost(c->h_out);
+
+        // Device staging buffers for pattern/replacement
+        if (c->d_pat_stage)
+            cudaFree(c->d_pat_stage);
+        if (c->d_rep_stage)
+            cudaFree(c->d_rep_stage);
 
         // Aux
         if (c->d_match)
@@ -2253,6 +2417,25 @@ extern "C"
         return "cuda_replace 2025-09-08 fused+seeded r3";
     }
 
+    EXPORT int cuda_replace_device_count()
+    {
+        int n = 0;
+        cudaGetDeviceCount(&n);
+        return n;
+    }
+
+    EXPORT int cuda_replace_set_device(int device_id)
+    {
+        return (int)cudaSetDevice(device_id);
+    }
+
+    EXPORT int cuda_replace_get_device()
+    {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        return dev;
+    }
+
     EXPORT int cuda_replace_open(void **ph, const uint8_t *src, size_t len)
     {
         if (!ph)
@@ -2269,7 +2452,11 @@ extern "C"
         CUDA_OK(cudaStreamCreate(&c->stream));
         CUDA_OK(cudaStreamCreate(&c->copy_stream));
 
-        c->use_fused = env_flag("CUDA_REPLACE_FUSED", 1);
+        // Default to the legacy (global-bitmap) path: it is both correct and
+        // faster than the fused tiled path for realistic inputs. The fused
+        // path (CUDA_REPLACE_FUSED=1) remains for experimentation but has a
+        // known cross-tile carry bug on dense patterns spanning many tiles.
+        c->use_fused = env_flag("CUDA_REPLACE_FUSED", 0);
 
         // Capacity & aux
         CUDA_OK(ensure_main_capacity(c, len ? len : 1));
@@ -2367,36 +2554,21 @@ extern "C"
 
         cudaError_t err = cudaSuccess;
         uint8_t *d_pat = nullptr, *d_rep = nullptr;
-        if (pat_len > 0)
-            CUDA_OK(cudaMalloc(&d_pat, (size_t)pat_len));
-        if (rep_len > 0)
-            CUDA_OK(cudaMalloc(&d_rep, (size_t)rep_len));
-        if (pat_len > 0)
-            CUDA_OK(cudaMemcpyAsync(d_pat, pat, (size_t)pat_len, cudaMemcpyHostToDevice, c->stream));
-        if (rep_len > 0)
-            CUDA_OK(cudaMemcpyAsync(d_rep, rep, (size_t)rep_len, cudaMemcpyHostToDevice, c->stream));
-        CUDA_OK(cudaStreamSynchronize(c->stream));
-
         int kept = 0, first = -1, last = -1;
-        int rc = apply_once(c, d_pat, pat_len, d_rep, rep_len, new_len, /*use_active*/ false,
-                            &kept, &first, &last, INT_MIN / 4);
+        int rc = 0;
+        CUDA_OK(stage_pattern_rep(c, pat, pat_len, rep, rep_len, &d_pat, &d_rep));
+
+        rc = apply_once(c, d_pat, pat_len, d_rep, rep_len, new_len, /*use_active*/ false,
+                        &kept, &first, &last, INT_MIN / 4);
         if (rc != 0)
         {
             err = cudaErrorUnknown;
             goto cuda_fail;
         }
 
-        if (d_pat)
-            cudaFree(d_pat);
-        if (d_rep)
-            cudaFree(d_rep);
         return 0;
 
     cuda_fail:
-        if (d_pat)
-            cudaFree(d_pat);
-        if (d_rep)
-            cudaFree(d_rep);
         return (int)err;
     }
 
@@ -2415,19 +2587,12 @@ extern "C"
 
         cudaError_t err = cudaSuccess;
         uint8_t *d_pat = nullptr, *d_rep = nullptr;
-        if (pat_len > 0)
-            CUDA_OK(cudaMalloc(&d_pat, (size_t)pat_len));
-        if (rep_len > 0)
-            CUDA_OK(cudaMalloc(&d_rep, (size_t)rep_len));
-        if (pat_len > 0)
-            CUDA_OK(cudaMemcpyAsync(d_pat, pat, (size_t)pat_len, cudaMemcpyHostToDevice, c->stream));
-        if (rep_len > 0)
-            CUDA_OK(cudaMemcpyAsync(d_rep, rep, (size_t)rep_len, cudaMemcpyHostToDevice, c->stream));
-        CUDA_OK(cudaStreamSynchronize(c->stream));
-
         int kept = 0, first = -1, last = -1;
-        int rc = apply_once(c, d_pat, pat_len, d_rep, rep_len, new_len, /*use_active*/ false,
-                            &kept, &first, &last, (int)prev_last_rel);
+        int rc = 0;
+        CUDA_OK(stage_pattern_rep(c, pat, pat_len, rep, rep_len, &d_pat, &d_rep));
+
+        rc = apply_once(c, d_pat, pat_len, d_rep, rep_len, new_len, /*use_active*/ false,
+                        &kept, &first, &last, (int)prev_last_rel);
         if (rc != 0)
         {
             err = cudaErrorUnknown;
@@ -2436,16 +2601,8 @@ extern "C"
         if (out_last_rel)
             *out_last_rel = (long long)last;
 
-        if (d_pat)
-            cudaFree(d_pat);
-        if (d_rep)
-            cudaFree(d_rep);
         return 0;
     cuda_fail:
-        if (d_pat)
-            cudaFree(d_pat);
-        if (d_rep)
-            cudaFree(d_rep);
         return (int)err;
     }
 
@@ -2484,32 +2641,14 @@ extern "C"
             int pl = pat_lens ? pat_lens[i] : 0;
             int rl = rep_lens ? rep_lens[i] : 0;
 
-            // ✅ Allocate device memory for this pattern/replacement
+            // Reuse device staging for this pattern/replacement.
             uint8_t *d_pat = nullptr, *d_rep = nullptr;
-            if (pl > 0)
-            {
-                CUDA_OK(cudaMalloc(&d_pat, (size_t)pl));
-                CUDA_OK(cudaMemcpyAsync(d_pat, p, (size_t)pl,
-                                        cudaMemcpyHostToDevice, c->stream));
-            }
-            if (rl > 0)
-            {
-                CUDA_OK(cudaMalloc(&d_rep, (size_t)rl));
-                CUDA_OK(cudaMemcpyAsync(d_rep, r, (size_t)rl,
-                                        cudaMemcpyHostToDevice, c->stream));
-            }
-            CUDA_OK(cudaStreamSynchronize(c->stream));
+            CUDA_OK(stage_pattern_rep(c, p, pl, r, rl, &d_pat, &d_rep));
 
             // Apply with device pointers
             int kept = 0, first = -1, last = -1;
             int rc = apply_once(c, d_pat, pl, d_rep, rl, &cur_len,
                                 false, &kept, &first, &last, INT_MIN / 4);
-
-            // Cleanup
-            if (d_pat)
-                cudaFree(d_pat);
-            if (d_rep)
-                cudaFree(d_rep);
 
             if (rc != 0)
             {
@@ -2540,17 +2679,22 @@ extern "C"
         if (c->len == 0)
             return 0;
 
-        void *host_ptr = nullptr;
         cudaError_t err = cudaSuccess;
-        CUDA_OK(cudaMallocHost(&host_ptr, c->len));
-        CUDA_OK(cudaMemcpyAsync(host_ptr, c->d_buf, c->len, cudaMemcpyDeviceToHost, c->stream));
+        // Reuse a persistent pinned buffer so repeated result()/length() calls
+        // don't pay cudaMallocHost/cudaFreeHost page-pinning churn every time.
+        if (c->h_out_cap < c->len)
+        {
+            if (c->h_out)
+                cudaFreeHost(c->h_out);
+            CUDA_OK(cudaHostAlloc((void **)&c->h_out, c->len, cudaHostAllocDefault));
+            c->h_out_cap = c->len;
+        }
+        CUDA_OK(cudaMemcpyAsync(c->h_out, c->d_buf, c->len, cudaMemcpyDeviceToHost, c->stream));
         CUDA_OK(cudaStreamSynchronize(c->stream));
 
-        *out_host = (uint8_t *)host_ptr;
+        *out_host = c->h_out;
         return 0;
     cuda_fail:
-        if (host_ptr)
-            cudaFreeHost(host_ptr);
         *out_host = nullptr;
         *outlen_host = 0;
         return (int)err;
@@ -2594,7 +2738,31 @@ extern "C"
 
         rc = cuda_replace_apply(h, pat, pat_len, rep, rep_len, out_len);
         if (rc == 0)
-            rc = cuda_replace_result(h, out_host, out_len);
+        {
+            // Copy the result into a caller-owned pinned buffer. We can't use
+            // cuda_replace_result()'s session-owned staging buffer here because
+            // the session is destroyed immediately below.
+            CRContext *c = (CRContext *)h;
+            if (c->len > 0)
+            {
+                cudaError_t err = cudaSuccess;
+                void *host_ptr = nullptr;
+                CUDA_OK(cudaMallocHost(&host_ptr, c->len));
+                CUDA_OK(cudaMemcpyAsync(host_ptr, c->d_buf, c->len, cudaMemcpyDeviceToHost, c->stream));
+                CUDA_OK(cudaStreamSynchronize(c->stream));
+                *out_host = (uint8_t *)host_ptr;
+                *out_len = c->len;
+            cuda_fail:
+                if (err != cudaSuccess)
+                {
+                    if (host_ptr)
+                        cudaFreeHost(host_ptr);
+                    *out_host = nullptr;
+                    *out_len = 0;
+                    rc = (int)err;
+                }
+            }
+        }
 
         cuda_replace_close(h);
         return rc;
