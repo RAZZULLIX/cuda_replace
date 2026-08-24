@@ -1,185 +1,237 @@
 # CUDA Replace
 
-High-throughput byte-pattern replacement on GPU. Python's `bytes.replace()` semantics without leaving device memory.
+High-throughput **byte-pattern replacement on the GPU**, with semantics that are
+byte-for-byte identical to Python's `bytes.replace()` — leftmost, non-overlapping
+matches, binary-safe (embedded NULs handled), and no CPU/GPU round-trip of the
+whole buffer when you reuse a session.
 
-## What It Does
+Designed for large-scale text / tokenization preprocessing, bulk HTML-entity
+cleaning, and any workload where you replace many patterns in multi-GB buffers.
 
-Performs leftmost, non-overlapping pattern replacement entirely on GPU. Designed for large-scale text processing, tokenization preprocessing, and streaming transformations.
+```
+┌─────────────┐   H2D once    ┌──────────────────────────────┐   D2H once   ┌─────────────┐
+│  host bytes │ ────────────▶ │  GPU session (d_buf)         │ ───────────▶ │ result bytes │
+└─────────────┘               │  apply() / apply_batch() × N  │              └─────────────┘
+                              └──────────────────────────────┘
+```
 
-**Use case:** Processing multi-GB files with repeated pattern replacement without CPU/GPU transfer overhead.
+---
 
-## Performance
+## Requirements
 
-- **Streaming mode**: Process unlimited file sizes with fixed GPU memory
-- **Session reuse**: Amortize allocation costs across multiple operations
-- **Fused pipeline**: Single-pass mark + suppress + scatter
-- **Thread-safe**: Per-handle mutex allows safe concurrent access
+- A CUDA-capable GPU. The build covers compute capability **7.5 → 12.1** (plus PTX
+  for future GPUs), so it runs on Turing (RTX 20xx), Ampere (RTX 30xx), Ada
+  (RTX 40xx), Hopper, and Blackwell (RTX 50xx) cards.
+- CUDA Toolkit **12.0+** (`nvcc`). Tested with CUDA 13.3.
+- Python **3.7+** (wrapper is pure stdlib `ctypes`; no third-party deps).
+
+---
 
 ## Installation
 
-**Pre-built binaries:** See `bin/` directory
+### Linux (recommended)
 
-**Build from source:**
 ```bash
-# Windows
+./build.sh
+```
+
+This produces `libcuda_replace.so` as a **fat binary** covering
+`sm_75, sm_80, sm_86, sm_89, sm_90, sm_120, sm_121` plus PTX for forward
+compatibility — one `.so` that runs on any supported GPU. `build.sh` is the
+canonical build; edit the `GENS` array if you want to add/remove architectures.
+
+### Windows
+
+```bash
 nvcc -O3 -std=c++17 -m64 -Xcompiler "/MD" -shared -o cuda_replace.dll cuda_replace.cu
-
-# Linux
-nvcc -O3 -std=c++17 -shared -Xcompiler -fPIC -o libcuda_replace.so cuda_replace.cu
 ```
 
-## Usage
+### macOS
 
-### One-Shot (Simple)
-
-```python
-from cuda_replace_wrapper import CudaReplaceLib
-
-lib = CudaReplaceLib('./cuda_replace.dll')  # or .so on Linux
-
-data = b"hello world hello universe"
-result = lib.unified(data, b"hello", b"goodbye")
-print(result)  # b"goodbye world goodbye universe"
+```bash
+nvcc -O3 -std=c++17 -shared -Xcompiler -fPIC -o libcuda_replace.dylib cuda_replace.cu
 ```
 
-### Session (Reusable GPU Buffer)
+---
+
+## Quick start
 
 ```python
-from cuda_replace_wrapper import Session
+from cuda_replace_wrapper import CudaReplaceLib, Session
 
+lib = CudaReplaceLib('./libcuda_replace.so')   # or .dll on Windows
+
+# One-shot
+print(lib.unified(b"hello world hello universe", b"hello", b"goodbye"))
+# b"goodbye world goodbye universe"
+
+# Session (reusable GPU buffer — amortizes the H2D/D2D transfer)
 with Session(lib, data) as sess:
     sess.apply(b"hello", b"hi")
     sess.apply(b"world", b"GPU")
     result = sess.result()
 ```
 
-### Streaming (Large Files)
+---
 
-```python
-from cuda_replace_wrapper import gpu_replace_streaming
-
-# Process multi-GB files with limited GPU memory
-with open('huge_file.txt', 'rb') as f:
-    data = f.read()
-
-pairs = [(b"pattern1", b"replacement1"), (b"pattern2", b"replacement2")]
-result = gpu_replace_streaming(lib, data, pairs, chunk_bytes=256*1024*1024)
-```
-
-### Batch Operations
-
-```python
-with Session(lib, data) as sess:
-    pairs = [
-        (b"old1", b"new1"),
-        (b"old2", b"new2"),
-        (b"old3", b"new3")
-    ]
-    new_len = sess.apply_batch(pairs)
-    result = sess.result()
-```
-
-## API Reference
+## API reference
 
 ### `CudaReplaceLib(dll_path: str)`
 
-Loads the CUDA replace library.
+Loads the shared library and binds all symbols.
 
-**Methods:**
-- `unified(src: bytes, pat: bytes, rep: bytes) -> bytes` - One-shot replacement
+| Method | Returns | Description |
+|---|---|---|
+| `unified(src, pat, rep)` | `bytes` | One-shot replacement (open → apply → result → close). |
+| `device_count()` | `int` | Number of CUDA devices visible to the process. |
+| `set_device(device_id)` | `None` | Bind the calling thread to a device (for multi-GPU use). |
 
 ### `Session(lib, src: bytes)`
 
-Persistent GPU session for efficient multi-operation workflows.
+A persistent GPU-resident buffer. **Reuse one Session across many operations** to
+amortize the host→device upload and device→host download; that is where the big
+speedup lives.
 
-**Methods:**
-- `apply(pat: bytes, rep: bytes) -> int` - Apply replacement, returns new length
-- `apply_batch(pairs: List[Tuple[bytes, bytes]]) -> int` - Apply multiple patterns sequentially
-- `apply_seeded(pat, rep, prev_last: int) -> (int, int)` - Apply with carry-in state for streaming
-- `reset(src: bytes)` - Replace buffer contents (O(1) if fits capacity)
-- `query_prefix(limit: int) -> (int, int)` - Count matches before position
-- `result() -> bytes` - Retrieve result from GPU
-- `length() -> int` - Get current buffer length
-- `close()` - Free GPU resources
+| Method | Returns | Description |
+|---|---|---|
+| `apply(pat, rep)` | `int` | Replace `pat` with `rep` in-place on the GPU; returns new length. |
+| `apply_batch(pairs)` | `int` | Apply a list of `(pat, rep)` sequentially (single transfer). |
+| `apply_seeded(pat, rep, prev_last_rel)` | `(int, int)` | Low-level streaming primitive: apply with a carry-in "last kept start". |
+| `query_prefix(limit)` | `(int, int)` | Low-level: count and last kept-start index strictly before `limit`. |
+| `reset(src)` | `None` | Replace buffer contents (O(1) if it fits capacity). |
+| `build_index(chunk_size=None)` | `None` | Optional presence index (no-op if unsupported). |
+| `result()` | `bytes` | Download the current buffer to host as `bytes`. |
+| `length()` | `int` | Current buffer length. |
+| `close()` | `None` | Free GPU resources (also called by `with`). |
 
-### `gpu_replace_streaming(lib, src, pairs, chunk_bytes=256MB) -> bytes`
+`Session` is a context manager and safe to share across threads for *distinct*
+sessions; each handle has an internal mutex.
 
-Memory-bounded streaming processor. Handles files larger than GPU memory.
+### `gpu_replace_streaming(lib, src, pairs, chunk_bytes=256*1024*1024) -> bytes`
 
-## Algorithm
+Memory-bounded replacement for buffers **larger than GPU memory**. It splits the
+input at match-free boundaries, processes each chunk independently, and
+concatenates — so the result is still bit-for-bit identical to `bytes.replace`.
+`chunk_bytes` bounds the per-chunk GPU footprint.
 
-1. **Mark Phase**: SIMD pattern matching across input (AVX2-style on GPU)
-2. **Suppress Phase**: Leftmost greedy selection (non-overlapping semantics)
-3. **Scatter Phase**: 
-   - **Shrink**: Compact output when `len(replacement) <= len(pattern)`
-   - **Expand**: Prefix-sum scatter when `len(replacement) > len(pattern)`
+### `gpu_replace_multicard(lib, src, pairs, devices=None, chunk_bytes=256MB, oversplit=8) -> bytes`
 
-**Optimizations:**
-- Fused mark+suppress in shared memory for small patterns
-- Tiled prefix computation (Blelloch scan)
-- Range-sliced expansion to avoid GPU TDR timeouts
-- Presence index for sparse patterns (optional)
+Parallel multi-GPU replacement. Splits the buffer into independent segments and
+processes them concurrently across the given CUDA devices (one worker thread per
+device, each holding a persistent Session). Bit-for-bit identical to
+`bytes.replace`.
 
-## Edge Cases
+```python
+from cuda_replace_wrapper import gpu_replace_multicard
 
-- **Handles embedded NULs** (binary-safe)
-- **Denormal floats** (FTZ/DAZ enabled)
-- **Thread-safe sessions** (internal mutex per handle)
-- **Overflow protection** (streaming mode prevents 32-bit expansion overflow)
+result = gpu_replace_multicard(lib, data, [(b"old", b"new")], devices=[0, 1, 2])
+```
+
+### `replace_unified(lib, src, pat, rep) -> bytes`
+
+Thin alias for `lib.unified(...)`.
+
+---
+
+## Batch vs. single-shot (read this before benchmarking)
+
+The GPU **compute** (mark + suppress + scatter) is much faster than CPython's
+`bytes.replace`. The wall-clock win depends on whether the CPU↔GPU transfer is
+amortized:
+
+| Workload | Typical result |
+|---|---|
+| **Batch** — many `(pat, rep)` pairs on one buffer via `Session`/`apply_batch` | **~13× faster** than the equivalent `bytes.replace` chain (one H2D + one D2D) |
+| **Session reuse** — many `apply()` calls, one `result()` | large win (same amortization) |
+| **Single one-shot** `unified()` on CPU-resident data | roughly parity — dominated by the D2D + creating the output `bytes`, not by the kernel |
+
+The floor for *returning* a fresh `bytes` of size `N` is the host memory
+allocation (page faults), which `bytes.replace` pays once too. That's why the
+single-shot case isn't "way faster", but batching is.
+
+Numbers measured on an RTX 3090, enwik8 (100 MB), 100 two-byte patterns:
+
+```
+CPU  bytes.replace chain   : ~15.3 s
+GPU  Session.apply_batch   : ~1.1 s   (13.4×)
+```
+
+---
+
+## Correctness
+
+- **Byte-for-byte identical to `bytes.replace`** for every input we tested:
+  fuzz (`test_diff.py`), enwik8 (100 MB, 8 patterns), enwik9 (1 GB via
+  streaming/multicard), dense overlapping patterns, and binary/NUL payloads.
+- **Binary-safe**: embedded NULs and arbitrary bytes are fine.
+- **Empty pattern** (`pat == b""`) matches Python (`rep` inserted between every
+  byte).
+- **Leftmost, non-overlapping** semantics — e.g. `b"aaaaa".replace(b"aaa", b"X")`
+  yields `b"XaX"`, not `b"XXa"`.
+
+### Algorithm
+
+1. **Mark** — SIMD pattern matching across the buffer.
+2. **Suppress** — leftmost greedy selection (non-overlapping).
+3. **Scatter** — compact output (shrink) or prefix-sum expansion (expand).
+
+The default path is the **legacy global-bitmap** pipeline (proven correct and
+fast). A fused tiled path exists behind `CUDA_REPLACE_FUSED=1` but is
+**experimental** — it has a known cross-tile carry bug on dense patterns and is
+disabled by default.
+
+---
+
+## Testing
+
+```bash
+./build.sh
+python3 test_diff.py                # fuzz vs bytes.replace (unified/session/batch/streaming)
+python3 test_real.py enwik8         # 100 MB correctness + benchmark (optional: enwik9)
+python3 bench_multicard.py enwik8   # per-card + multi-card benchmarks
+```
+
+`enwik8`/`enwik9` are large test corpora you supply yourself (they are not part
+of this repo).
+
+---
 
 ## Files
 
-- `cuda_replace.cu` - CUDA kernel implementation
-- `cuda_replace_wrapper.py` - Python ctypes interface
-- `bin/` - Pre-compiled libraries
-- `test/` - Usage examples
+| File | Purpose |
+|---|---|
+| `cuda_replace.cu` | CUDA kernels + exported C API (the whole library). |
+| `cuda_replace_wrapper.py` | Pure-stdlib `ctypes` Python wrapper. |
+| `build.sh` | Linux multi-arch fat-binary build. |
+| `test_diff.py` | Differential fuzz tests vs `bytes.replace`. |
+| `test_real.py` | Real-file correctness + benchmark (enwik8/enwik9). |
+| `bench_multicard.py` | Per-card and multi-card benchmarks. |
 
-## Example: Tokenizer Preprocessing
+---
 
-```python
-# Replace special tokens in bulk before tokenization
-text = load_huge_corpus()  # 10GB text file
+## C API (for non-Python callers)
 
-replacements = [
-    (b"<br>", b"\n"),
-    (b"&nbsp;", b" "),
-    (b"&amp;", b"&"),
-    # ... 100+ HTML entities
-]
+The `.so`/`.dll` exports a flat C ABI (declared in `cuda_replace.cu`):
 
-cleaned = gpu_replace_streaming(lib, text, replacements)
-```
+- `int cuda_replace_unified(const uint8_t* src, size_t src_len, const uint8_t* pat, int pat_len, const uint8_t* rep, int rep_len, uint8_t** out_host, size_t* out_len)`
+- `int cuda_replace_open(void** h, const uint8_t* src, size_t len)`
+- `int cuda_replace_reset(void* h, const uint8_t* src, size_t len)`
+- `int cuda_replace_apply(void* h, const uint8_t* pat, int pat_len, const uint8_t* rep, int rep_len, size_t* new_len)`
+- `int cuda_replace_apply_batch(void* h, const uint8_t** pats, const int* pat_lens, const uint8_t** reps, const int* rep_lens, int count, size_t* new_len)`
+- `int cuda_replace_build_index(void* h, size_t chunk_size)`
+- `int cuda_replace_apply_seeded(void* h, const uint8_t* pat, int pat_len, const uint8_t* rep, int rep_len, long long prev_last_rel, long long* out_last_rel, size_t* new_len)`
+- `int cuda_replace_query_prefix(void* h, size_t limit, int* kept_before, int* last_before)`
+- `int cuda_replace_result(void* h, uint8_t** out_host, size_t* out_len)`
+- `void cuda_free_host(void* p)`
+- `void cuda_replace_close(void* h)`
+- `const char* cuda_replace_version(void)`
+- `int cuda_replace_device_count(void)`, `int cuda_replace_set_device(int)`, `int cuda_replace_get_device(void)`
 
-## Benchmarking
+Return codes: `0` = success, negative = argument error, otherwise a CUDA error
+code (`cudaGetErrorString`-compatible).
 
-```python
-import time
-
-data = b"a" * (1024 * 1024 * 1024)  # 1GB of 'a's
-pat = b"aa"
-rep = b"X"
-
-# CPU baseline
-start = time.perf_counter()
-cpu_result = data.replace(pat, rep)
-cpu_time = time.perf_counter() - start
-
-# GPU
-start = time.perf_counter()
-gpu_result = lib.unified(data, pat, rep)
-gpu_time = time.perf_counter() - start
-
-print(f"CPU: {cpu_time:.3f}s")
-print(f"GPU: {gpu_time:.3f}s")
-print(f"Speedup: {cpu_time/gpu_time:.2f}x")
-```
-
-## Requirements
-
-- CUDA-capable GPU (compute capability 3.5+)
-- CUDA Toolkit 11.0+ (for building)
-- Python 3.7+ (for wrapper)
+---
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
