@@ -93,6 +93,14 @@ class CudaReplaceLib:
         lib.cuda_replace_close.argtypes = [c_void_p]
         lib.cuda_replace_close.restype = None
 
+        # int cuda_replace_device_count() / set_device / get_device
+        lib.cuda_replace_device_count.argtypes = []
+        lib.cuda_replace_device_count.restype = C.c_int
+        lib.cuda_replace_set_device.argtypes = [C.c_int]
+        lib.cuda_replace_set_device.restype = C.c_int
+        lib.cuda_replace_get_device.argtypes = []
+        lib.cuda_replace_get_device.restype = C.c_int
+
         # --- NEW: reset / seeded apply / prefix query (thread-safe in DLL) ---
         if hasattr(lib, "cuda_replace_reset"):
             lib.cuda_replace_reset.argtypes = [c_void_p, c_uint8_p, c_size_t]
@@ -120,8 +128,19 @@ class CudaReplaceLib:
         else:
             lib.cuda_replace_query_prefix = None  # type: ignore[assignment]
 
+    def device_count(self) -> int:
+        return int(self.lib.cuda_replace_device_count())
+
+    def set_device(self, device_id: int) -> None:
+        rc = self.lib.cuda_replace_set_device(C.c_int(int(device_id)))
+        if rc != 0:
+            raise RuntimeError(f"cuda_replace_set_device({device_id}) failed rc={rc}")
+
     # Convenience one-shot call
     def unified(self, src: bytes, pat: bytes, rep: bytes) -> bytes:
+        if len(pat) == 0:
+            # Python's bytes.replace(b'', rep) inserts rep between every byte.
+            return src.replace(b"", rep)
         src_buf = C.create_string_buffer(src)
         pat_buf = C.create_string_buffer(pat)
         rep_buf = C.create_string_buffer(rep)
@@ -185,6 +204,11 @@ class Session:
             raise RuntimeError(f"cuda_replace_build_index failed rc={rc}")
 
     def apply(self, pat: bytes, rep: bytes) -> int:
+        if len(pat) == 0:
+            cur = self.result()
+            new = cur.replace(b"", rep)
+            self.reset(new)
+            return len(new)
         pat_buf = C.create_string_buffer(pat)
         rep_buf = C.create_string_buffer(rep)
         new_len = c_size_t()
@@ -222,6 +246,13 @@ class Session:
     def apply_batch(self, pairs: Sequence[Tuple[bytes, bytes]]) -> int:
         count = len(pairs)
         if count == 0:
+            return self.length()
+
+        # Empty patterns are handled by the sequential path (which delegates to
+        # Python's native bytes.replace for that edge case).
+        if any(len(pat) == 0 for pat, _rep in pairs):
+            for pat, rep in pairs:
+                self.apply(pat, rep)
             return self.length()
 
         pat_bufs: List[C.Array] = []
@@ -276,10 +307,9 @@ class Session:
         rc = self.lib.lib.cuda_replace_result(self.h, C.byref(out_ptr), C.byref(out_len))
         if rc != 0:
             raise RuntimeError(f"cuda_replace_result failed rc={rc}")
-        try:
-            return C.string_at(out_ptr, out_len.value)
-        finally:
-            self.lib.lib.cuda_free_host(out_ptr)
+        # The returned pointer aliases the session's persistent pinned staging
+        # buffer; it stays valid until close() and must NOT be freed here.
+        return C.string_at(out_ptr, out_len.value)
 
     def length(self) -> int:
         out_ptr = c_uint8_p()
@@ -287,7 +317,6 @@ class Session:
         rc = self.lib.lib.cuda_replace_result(self.h, C.byref(out_ptr), C.byref(out_len))
         if rc != 0:
             raise RuntimeError(f"cuda_replace_result(len) failed rc={rc}")
-        self.lib.lib.cuda_free_host(out_ptr)
         return int(out_len.value)
 
     def close(self):
@@ -302,67 +331,183 @@ def replace_unified(lib: CudaReplaceLib, src: bytes, pat: bytes, rep: bytes) -> 
     """One-shot convenience around cuda_replace_unified()."""
     return lib.unified(src, pat, rep)
 
+def _next_safe_boundary(data: bytes, pat: bytes, lo: int, hi: int) -> int:
+    """Return the largest split index ``b`` in ``(lo, hi]`` such that no
+    occurrence of ``pat`` starts in ``[b - len(pat) + 1, b - 1]`` (i.e. no match
+    crosses the boundary ``b``).  Such a boundary lets each side be replaced
+    independently with ``bytes.replace`` semantics.
+
+    Returns ``lo`` when no safe boundary exists in ``(lo, hi]``.
+    """
+    L = len(pat)
+    b = hi
+    while b > lo:
+        start = b - L + 1
+        if start < 0:
+            start = 0
+        # Earliest occurrence of pat starting in [start, b) (and thus crossing b).
+        p = data.find(pat, start, b + L - 1)
+        if p == -1 or p >= b:
+            return b
+        b = p
+    return lo
+
+
 def gpu_replace_streaming(lib: CudaReplaceLib,
                           src: bytes,
                           pairs: Iterable[Tuple[bytes, bytes]],
                           chunk_bytes: int = 256 * 1024 * 1024) -> bytes:
+    """Memory-bounded replacement that is bit-for-bit identical to sequential
+    ``bytes.replace``.  Each pattern is applied to the whole buffer in
+    independent chunks; chunk boundaries are chosen so that no match crosses
+    them, which makes the concatenation of per-chunk results exactly correct.
+    """
     if chunk_bytes <= 0:
         chunk_bytes = 1
     out = src
-    SEED_NEG_INF = -(1 << 29)
-    MAX_SAFE_EXPANSION = (1 << 30)  # Stay well below 2^31 to prevent GPU kernel overflow
-    
     with Session(lib, b"") as sess:
-        for (pat, rep) in pairs:
+        for pat, rep in pairs:
             L = len(pat)
             if L == 0:
+                out = out.replace(b"", rep)
                 continue
-            diff = len(rep) - L
-            pos = 0
-            prev_last_global = SEED_NEG_INF
-            result_chunks: List[bytes] = []
             n = len(out)
-            
+            if n == 0:
+                continue
+            result: List[bytes] = []
+            pos = 0
             while pos < n:
-                # Dynamically adjust chunk size to prevent integer overflow in GPU kernels
-                effective_chunk_size = chunk_bytes
-                
-                if diff > 0:  # Only worry about expansion
-                    # Worst-case: every L bytes could be a match
-                    max_possible_matches = chunk_bytes // L if L > 0 else chunk_bytes
-                    estimated_expansion = max_possible_matches * diff
-                    
-                    # If expansion would exceed safe limits, reduce chunk size
-                    if estimated_expansion > MAX_SAFE_EXPANSION:
-                        safe_matches = MAX_SAFE_EXPANSION // diff
-                        effective_chunk_size = safe_matches * L
-                        effective_chunk_size = max(effective_chunk_size, L)  # At least one pattern length
-                        effective_chunk_size = min(effective_chunk_size, chunk_bytes)  # Don't exceed original
-                
-                base_end = min(pos + effective_chunk_size, n)
-                overlap = max(0, L - 1)
-                take_end = min(base_end + overlap, n)
-                chunk = out[pos:take_end]
+                end = pos + chunk_bytes
+                if end < n:
+                    end = _next_safe_boundary(out, pat, pos, end)
+                    if end <= pos:
+                        # Pathological dense-overlap input: no safe split found,
+                        # so fall back to processing the entire remainder.
+                        end = n
+                else:
+                    end = n
+                chunk = out[pos:end]
                 sess.reset(chunk)
-                
-                seed_rel = prev_last_global - pos
-                if seed_rel < -(1 << 30):
-                    seed_rel = -(1 << 30)
-                if seed_rel > (1 << 30):
-                    seed_rel = (1 << 30)
-                
-                _new_len, _last_rel = sess.apply_seeded(pat, rep, int(seed_rel))
-                kept_before, last_before = sess.query_prefix(base_end - pos)
-                out_prefix_end = (base_end - pos) + kept_before * diff
-                gpu_out = sess.result()
-                out_prefix_end = min(out_prefix_end, len(gpu_out))
-                if out_prefix_end < 0:
-                    out_prefix_end = 0
-                result_chunks.append(gpu_out[:out_prefix_end])
-                if last_before >= 0:
-                    prev_last_global = pos + last_before
-                pos = base_end
-            out = b"".join(result_chunks)
+                sess.apply(pat, rep)
+                result.append(sess.result())
+                pos = end
+            out = b"".join(result)
+    return out
+
+
+# ---- Multi-GPU helpers ----
+
+def _split_safe_segments(data: bytes, pat: bytes, num_parts: int,
+                         max_segment: int = 1 << 30) -> List[Tuple[int, int]]:
+    """Split ``data`` into roughly ``num_parts`` independent ``(start, end)``
+    ranges at boundaries where no match of ``pat`` crosses.  Each range can be
+    replaced independently and concatenated, exactly like ``bytes.replace``.
+
+    ``max_segment`` caps the size of any single range (to bound GPU memory).
+    """
+    L = len(pat)
+    n = len(data)
+    if n == 0:
+        return []
+    if L <= 0 or num_parts <= 1:
+        return [(0, n)]
+    target = (n + num_parts - 1) // num_parts
+    if target > max_segment:
+        target = max_segment
+    if target < 1:
+        target = 1
+    segments: List[Tuple[int, int]] = []
+    pos = 0
+    while pos < n:
+        end = pos + target
+        if end < n:
+            end = _next_safe_boundary(data, pat, pos, end)
+            if end <= pos:
+                end = n  # pathological: no safe split; take the rest
+        else:
+            end = n
+        segments.append((pos, end))
+        pos = end
+    return segments
+
+
+def _multicard_worker(lib: "CudaReplaceLib", device_id: int,
+                      in_q, out_q) -> None:
+    """Persistent worker thread bound to one GPU. Reuses a single Session."""
+    lib.set_device(device_id)
+    sess = Session(lib, b"")
+    while True:
+        item = in_q.get()
+        if item is None:
+            break
+        job_id, data, pat, rep = item
+        try:
+            sess.reset(data)
+            sess.apply(pat, rep)
+            out_q.put((job_id, sess.result(), None))
+        except Exception as exc:  # pragma: no cover - error propagation
+            out_q.put((job_id, None, exc))
+
+
+def gpu_replace_multicard(lib: "CudaReplaceLib",
+                          src: bytes,
+                          pairs: Iterable[Tuple[bytes, bytes]],
+                          devices: Optional[Sequence[int]] = None,
+                          chunk_bytes: int = 256 * 1024 * 1024,
+                          oversplit: int = 8) -> bytes:
+    """Parallel multi-GPU replacement.
+
+    Splits the buffer into independent segments (at match-free boundaries) and
+    processes them concurrently across the given CUDA devices, one worker
+    thread per device, each holding a persistent Session.  The result is
+    bit-for-bit identical to ``bytes.replace`` (and to :func:`gpu_replace_streaming`).
+    """
+    if chunk_bytes <= 0:
+        chunk_bytes = 1
+    dev_list = list(devices) if devices is not None else list(range(lib.device_count()))
+    dev_list = [int(d) for d in dev_list if int(d) < lib.device_count()]
+    if not dev_list:
+        raise RuntimeError("no CUDA devices available")
+    if len(dev_list) == 1:
+        return gpu_replace_streaming(lib, src, pairs, chunk_bytes)
+
+    import queue
+    import threading
+
+    out = src
+    nworkers = len(dev_list)
+    in_q = queue.Queue()
+    out_q = queue.Queue()
+    threads = []
+    for d in dev_list:
+        t = threading.Thread(target=_multicard_worker, args=(lib, d, in_q, out_q), daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        for pat, rep in pairs:
+            L = len(pat)
+            if L == 0:
+                out = out.replace(b"", rep)
+                continue
+            n = len(out)
+            if n == 0:
+                continue
+            segments = _split_safe_segments(out, pat, nworkers * oversplit, chunk_bytes)
+            for i, (a, b) in enumerate(segments):
+                in_q.put((i, out[a:b], pat, rep))
+            results: List[Optional[bytes]] = [None] * len(segments)
+            for _ in segments:
+                jid, res, err = out_q.get()
+                if err is not None:
+                    raise RuntimeError(f"multi-GPU worker failed: {err}")
+                results[jid] = res
+            out = b"".join(r for r in results if r is not None)
+    finally:
+        for _ in threads:
+            in_q.put(None)
+        for t in threads:
+            t.join()
     return out
 
 
